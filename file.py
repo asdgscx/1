@@ -6,13 +6,12 @@
    計算四個季度區間報酬率，並用 40/20/20/20 權重得到綜合 PR 分數。
 2. 股票代號製圖：輸入股票代號與日期區間，產生個股相對大盤的基期 100 圖，
    以及 63 日動能 PR 曲線。
-3. 買進視窗回測：模擬買進後的走勢，並執行停利停損策略。
+3. 買進視窗回測：模擬買進後的走勢，並嚴格執行 7% 絕對停損策略。
 """
 
 import io
 import os
 import sqlite3
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -276,8 +275,8 @@ class MomentumDatabase:
                 SELECT 1
                 FROM price_fetch_failures
                 WHERE ticker = ?
-                  AND start_date = ?
-                  AND end_date = ?
+                  AND start_date <= ?
+                  AND end_date >= ?
                 LIMIT 1
             """, (ticker, start_date, end_date)).fetchone()
         return row is not None 
@@ -295,8 +294,8 @@ class MomentumDatabase:
             conn.execute("""
                 DELETE FROM price_fetch_failures
                 WHERE ticker = ?
-                  AND start_date = ?
-                  AND end_date = ?
+                  AND start_date <= ?
+                  AND end_date >= ?
             """, (ticker, start_date, end_date))
 
     def has_price_range(self, ticker: str, start_date: str, end_date: str, max_gap_days: int, min_coverage_ratio: float) -> bool:
@@ -316,16 +315,11 @@ class MomentumDatabase:
             return False
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
-        effective_end_dt = min(end_dt, pd.Timestamp.today().normalize())
         if df["date"].min() > start_dt + pd.Timedelta(days=7):
             return False
-        if df["date"].max() < start_dt:
+        if df["date"].max() < end_dt - pd.Timedelta(days=7):
             return False
-        required_dates = pd.bdate_range(start_dt, effective_end_dt)
-        required_last_date = required_dates[-1] if len(required_dates) else effective_end_dt
-        if df["date"].max() < required_last_date:
-            return False
-        expected_days = len(pd.bdate_range(start_dt, effective_end_dt))
+        expected_days = len(pd.bdate_range(start_dt, end_dt))
         if expected_days and len(df) / expected_days < min_coverage_ratio:
             return False
         max_gap = df["date"].diff().dt.days.max()
@@ -677,7 +671,7 @@ class MomentumPRAnalyzer:
             return {"ok": False, "message": f"無法產生 {ticker} 圖表。"}
         return {"ok": True, "message": f"已產生 {ticker} 動能視覺化圖。", "image": os.path.basename(output_path)}
 
-    def run_buy_date_window(self, code_or_ticker: str, buy_date: str, stop_loss_pct: Optional[float] = None, take_profit_pct: Optional[float] = None) -> dict:
+    def run_buy_date_window(self, code_or_ticker: str, buy_date: str) -> dict:
         """
         🔥 升級版買入視窗回測：加入 CAN SLIM 絕對停損機制
         """
@@ -685,8 +679,6 @@ class MomentumPRAnalyzer:
         buy_dt = pd.to_datetime(buy_date)
         start_date = (buy_dt - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
         end_date = (buy_dt + pd.DateOffset(months=2)).strftime("%Y-%m-%d")
-        stop_loss_pct = self.config.stop_loss_pct if stop_loss_pct is None else max(float(stop_loss_pct), 0.0) / 100
-        take_profit_pct = None if take_profit_pct is None or float(take_profit_pct) <= 0 else float(take_profit_pct) / 100
 
         self.db.init()
         code, ticker = make_ticker(code_or_ticker)
@@ -716,7 +708,6 @@ class MomentumPRAnalyzer:
         price_df["date"] = pd.to_datetime(price_df["date"], errors="coerce")
         price_df["close"] = pd.to_numeric(price_df["close"], errors="coerce")
         price_df["open"] = pd.to_numeric(price_df["open"], errors="coerce")
-        price_df["high"] = pd.to_numeric(price_df["high"], errors="coerce")
         price_df["low"] = pd.to_numeric(price_df["low"], errors="coerce") # 載入盤中最低價
         price_df = price_df.dropna(subset=["date", "close"]).sort_values("date")
         price_df["buy_line_price"] = price_df["open"].fillna(price_df["close"])
@@ -728,71 +719,50 @@ class MomentumPRAnalyzer:
         # 1. 確立買進成本與停損價位
         buy_row = buy_rows.iloc[0]
         buy_price = buy_row["open"] if pd.notna(buy_row["open"]) else buy_row["close"]
-        stop_price = buy_price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
-        take_profit_price = buy_price * (1 + take_profit_pct) if take_profit_pct is not None else None
+        stop_price = buy_price * (1 - self.config.stop_loss_pct)
 
-        # 2. 模擬持有期間 (從買入後的下一天開始檢查停損/停利)
+        # 2. 模擬持有期間 (從買入後的下一天開始檢查停損)
         post_buy_df = price_df[price_df["date"] > buy_row["date"]]
         
         stopped_out = False
-        took_profit = False
-        exit_reason = "window_end"
         exit_date = price_df.iloc[-1]["date"]
         exit_price = price_df.iloc[-1]["close"]
 
-        # 每天用高低價檢查是否觸發停損或停利；同日都碰到時採保守假設，先視為停損。
+        # 每天檢查最低價是否跌破停損線
         for _, daily_row in post_buy_df.iterrows():
             current_low = daily_row["low"] if pd.notna(daily_row["low"]) else daily_row["close"]
-            current_high = daily_row["high"] if pd.notna(daily_row["high"]) else daily_row["close"]
-            hit_stop = stop_price is not None and current_low <= stop_price
-            hit_profit = take_profit_price is not None and current_high >= take_profit_price
-            if hit_stop:
+            if current_low <= stop_price:
                 stopped_out = True
                 exit_date = daily_row["date"]
-                exit_price = stop_price
-                exit_reason = "stop_loss"
-                break
-            if hit_profit:
-                took_profit = True
-                exit_date = daily_row["date"]
-                exit_price = take_profit_price
-                exit_reason = "take_profit"
+                exit_price = stop_price  # 假設在停損價位觸發賣出
                 break
 
         window_return = (exit_price / buy_price) - 1 if buy_price else 0.0
         display_name = f"{code} {name}"
 
-        # 製圖準備：只使用實際交易日，避免補週末/休市日造成線圖看起來每天跳空。
-        plot_df = price_df[["date", "open", "high", "low", "close", "buy_line_price"]].copy()
-        plot_df = plot_df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-        plot_df["x"] = range(len(plot_df))
-        buy_x = int(plot_df.loc[plot_df["date"] == buy_row["date"], "x"].iloc[0])
-        exit_x = int(plot_df.loc[plot_df["date"] == exit_date, "x"].iloc[0]) if exit_date in set(plot_df["date"]) else int(plot_df["x"].iloc[-1])
+        # 製圖準備：把交易日資料補成日曆日序列
+        plot_df = (
+            price_df.set_index("date")[["buy_line_price", "close", "low"]]
+            .reindex(pd.date_range(price_df["date"].min(), price_df["date"].max(), freq="D"))
+            .ffill()
+            .reset_index()
+            .rename(columns={"index": "date"})
+        )
 
         fig, ax = plt.subplots(figsize=(12, 5.8))
-        ax.vlines(plot_df["x"], plot_df["low"], plot_df["high"], color="#cbd5e1", linewidth=1, alpha=0.85, label="當日高低")
-        ax.plot(plot_df["x"], plot_df["open"], color="#2563eb", linewidth=1.8, label="開盤價")
-        ax.plot(plot_df["x"], plot_df["close"], color="#475569", linewidth=1.8, label="收盤價")
-        ax.axvline(buy_x, color="#dc2626", linestyle="--", linewidth=1.4, label="買進日")
-        ax.scatter([buy_x], [buy_price], color="#dc2626", s=55, zorder=4)
+        ax.plot(plot_df["date"], plot_df["buy_line_price"], color="#2563eb", linewidth=2, label="開盤價")
+        ax.plot(plot_df["date"], plot_df["close"], color="#94a3b8", linewidth=1.3, alpha=0.65, label="收盤價")
+        ax.axvline(buy_row["date"], color="#dc2626", linestyle="--", linewidth=1.4, label="買進日")
+        ax.scatter([buy_row["date"]], [buy_price], color="#dc2626", s=50, zorder=3)
         
-        # 🛡️ 畫上停損/停利線與出場點位
-        if stop_price is not None:
-            ax.hlines(y=stop_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#f59e0b", linestyle=":", linewidth=2, label=f"停損線 (-{stop_loss_pct*100:.1f}%)")
-        if take_profit_price is not None:
-            ax.hlines(y=take_profit_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#16a34a", linestyle=":", linewidth=2, label=f"停利線 (+{take_profit_pct*100:.1f}%)")
-        if stopped_out or took_profit:
-            marker_color = "#000000" if stopped_out else "#16a34a"
-            marker_label = "觸發停損出場" if stopped_out else "觸發停利出場"
-            ax.scatter([exit_x], [exit_price], color=marker_color, marker="v", s=80, zorder=4, label=marker_label)
-            ax.axvline(exit_x, color=marker_color, linestyle=":", linewidth=1, alpha=0.6)
+        # 🛡️ 畫上停損線與停損點位
+        ax.hlines(y=stop_price, xmin=buy_row["date"], xmax=plot_df["date"].max(), color="#f59e0b", linestyle=":", linewidth=2, label=f"絕對停損線 (-{self.config.stop_loss_pct*100:.0f}%)")
+        if stopped_out:
+            ax.scatter([exit_date], [exit_price], color="#000000", marker="v", s=80, zorder=4, label="觸發停損出場")
+            ax.axvline(exit_date, color="#000000", linestyle=":", linewidth=1, alpha=0.6)
 
-        ax.set_title(f"{display_name} 買入視窗回測")
+        ax.set_title(f"{display_name} 買入視窗回測 (含 CAN SLIM 停損機制)")
         ax.set_ylabel("Price")
-        tick_count = min(8, len(plot_df))
-        tick_indexes = sorted(set(round(i * (len(plot_df) - 1) / max(tick_count - 1, 1)) for i in range(tick_count)))
-        ax.set_xticks(tick_indexes)
-        ax.set_xticklabels([plot_df.loc[i, "date"].strftime("%Y-%m-%d") for i in tick_indexes], rotation=0)
         ax.grid(True, alpha=0.25)
         ax.legend()
         fig.tight_layout()
@@ -804,11 +774,9 @@ class MomentumPRAnalyzer:
         # 動態產生回報訊息
         msg = f"{display_name}：買入 {buy_row['date'].strftime('%Y-%m-%d')} ({buy_price:.2f})。"
         if stopped_out:
-            msg += f" 於 {exit_date.strftime('%Y-%m-%d')} 觸發停損出場，結算報酬率 {window_return * 100:.2f}%"
-        elif took_profit:
-            msg += f" 於 {exit_date.strftime('%Y-%m-%d')} 觸發停利出場，結算報酬率 {window_return * 100:.2f}%"
+            msg += f" ⚠️ 於 {exit_date.strftime('%Y-%m-%d')} 觸發停損出場，結算報酬率 {window_return * 100:.2f}%"
         else:
-            msg += f" 視窗期末未觸發停損/停利，結算報酬率 {window_return * 100:.2f}%"
+            msg += f" 視窗期末未跌破停損，結算報酬率 {window_return * 100:.2f}%"
 
         return {
             "ok": True,
@@ -818,8 +786,6 @@ class MomentumPRAnalyzer:
             "buy_price": round(float(buy_price), 2),
             "window_return": round(float(window_return), 4) if window_return is not None else None,
             "stopped_out": stopped_out,
-            "took_profit": took_profit,
-            "exit_reason": exit_reason,
         }
 
 APP_HTML = """
@@ -911,9 +877,6 @@ APP_HTML = """
     }
     input[type="date"] {
       width: 170px;
-    }
-    input[type="number"] {
-      width: 96px;
     }
     label {
       display: inline-flex;
@@ -1008,8 +971,6 @@ APP_HTML = """
   <section id="market" class="active">
     <div class="toolbar">
       <label>查詢日期 <input type="date" id="prDate"></label>
-      <label>停損% <input type="number" id="stopLossPct" min="0" step="0.5" value="7"></label>
-      <label>停利% <input type="number" id="takeProfitPct" min="0" step="0.5" value="20"></label>
       <button class="primary" id="runPr">執行市場 PR 篩選</button>
     </div>
     <div class="status" id="marketStatus" style="color: var(--muted); font-weight: normal;">讀取全上市清單與股價快取，查詢日最早為三年前。</div>
@@ -1023,7 +984,7 @@ APP_HTML = """
         <thead>
           <tr>
             <th>Rank</th><th>名稱</th><th>代號</th><th>綜合分數</th>
-            <th>Q1報酬</th><th>Q2報酬</th><th>Q3報酬</th><th>Q4報酬</th><th>回測</th>
+            <th>Q1報酬</th><th>Q2報酬</th><th>Q3報酬</th><th>Q4報酬</th><th>回測 (含停損)</th>
           </tr>
         </thead>
         <tbody id="resultRows"></tbody>
@@ -1094,93 +1055,72 @@ chartEnd.addEventListener("change", () => {
 });
 
 document.getElementById("runPr").addEventListener("click", async () => {
-  const runButton = document.getElementById("runPr");
   const status = document.getElementById("marketStatus");
   const selectedDate = document.getElementById("prDate").value;
-  if (runButton.disabled) return;
-  runButton.disabled = true;
   status.textContent = "執行中，第一次需捕捉較多資料，請耐心等候...";
-  try {
-    const res = await fetch("/api/run-pr", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ end_date: selectedDate })
-    });
-    const data = await res.json();
-    status.textContent = data.message || "";
-    document.getElementById("totalCount").textContent = data.total_count ?? "-";
-    document.getElementById("strongCount").textContent = data.strong_count ?? "-";
+  const res = await fetch("/api/run-pr", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ end_date: selectedDate })
+  });
+  const data = await res.json();
+  status.textContent = data.message || "";
+  document.getElementById("totalCount").textContent = data.total_count ?? "-";
+  document.getElementById("strongCount").textContent = data.strong_count ?? "-";
 
-    const links = document.getElementById("csvLinks");
-    links.innerHTML = data.ok ? `
-      <a href="/outputs/${data.score_csv}" target="_blank">全部 PR 報表</a>
-      <a href="/outputs/${data.strong_csv}" target="_blank">PR80 強勢股</a>
-    ` : "";
+  const links = document.getElementById("csvLinks");
+  links.innerHTML = data.ok ? `
+    <a href="/outputs/${data.score_csv}" target="_blank">全部 PR 報表</a>
+    <a href="/outputs/${data.strong_csv}" target="_blank">PR80 強勢股</a>
+  ` : "";
 
-    const body = document.getElementById("resultRows");
-    body.innerHTML = "";
-    (data.rows || []).forEach(row => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${row.rank}</td>
-        <td>${row.name || ""}</td>
-        <td>${row.ticker || ""}</td>
-        <td>${Number(row.weighted_pr_score).toFixed(2)}</td>
-        <td>${pct(row.q1_return_recent)}</td>
-        <td>${pct(row.q2_return)}</td>
-        <td>${pct(row.q3_return)}</td>
-        <td>${pct(row.q4_return_oldest)}</td>
-        <td><button class="small backtest" data-ticker="${row.ticker || ""}">模擬回測</button></td>
-      `;
-      body.appendChild(tr);
-    });
+  const body = document.getElementById("resultRows");
+  body.innerHTML = "";
+  (data.rows || []).forEach(row => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${row.rank}</td>
+      <td>${row.name || ""}</td>
+      <td>${row.ticker || ""}</td>
+      <td>${Number(row.weighted_pr_score).toFixed(2)}</td>
+      <td>${pct(row.q1_return_recent)}</td>
+      <td>${pct(row.q2_return)}</td>
+      <td>${pct(row.q3_return)}</td>
+      <td>${pct(row.q4_return_oldest)}</td>
+      <td><button class="small backtest" data-ticker="${row.ticker || ""}">模擬回測</button></td>
+    `;
+    body.appendChild(tr);
+  });
 
-    document.querySelectorAll(".backtest").forEach(button => {
-      button.addEventListener("click", async () => {
-        const ticker = button.dataset.ticker;
-        const backtestStatus = document.getElementById("backtestStatus");
-        const backtestImage = document.getElementById("backtestImage");
-        if (button.disabled) return;
-        button.disabled = true;
-        backtestStatus.textContent = `${ticker} 執行停損回測運算中...`;
-        backtestStatus.style.color = "var(--text)";
-        backtestImage.style.display = "none";
-        try {
-          const btRes = await fetch("/api/backtest-window", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              symbol: ticker,
-              buy_date: document.getElementById("prDate").value,
-              stop_loss_pct: document.getElementById("stopLossPct").value,
-              take_profit_pct: document.getElementById("takeProfitPct").value
-            })
-          });
-          const btData = await btRes.json();
-          backtestStatus.textContent = btData.message || "";
-          if (btData.stopped_out) {
-            backtestStatus.style.color = "var(--bad)";
-          } else if (btData.took_profit) {
-            backtestStatus.style.color = "var(--good)";
-          } else if (btData.window_return > 0) {
-            backtestStatus.style.color = "var(--good)";
-          }
-          if (btData.ok) {
-            backtestImage.src = `/outputs/${btData.image}?t=${Date.now()}`;
-            backtestImage.style.display = "block";
-          }
-        } finally {
-          button.disabled = false;
-        }
+  document.querySelectorAll(".backtest").forEach(button => {
+    button.addEventListener("click", async () => {
+      const ticker = button.dataset.ticker;
+      const backtestStatus = document.getElementById("backtestStatus");
+      const backtestImage = document.getElementById("backtestImage");
+      backtestStatus.textContent = `${ticker} 執行停損回測運算中...`;
+      backtestStatus.style.color = "var(--text)";
+      backtestImage.style.display = "none";
+      const btRes = await fetch("/api/backtest-window", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: ticker, buy_date: document.getElementById("prDate").value })
       });
+      const btData = await btRes.json();
+      backtestStatus.textContent = btData.message || "";
+      if (btData.stopped_out) {
+        backtestStatus.style.color = "var(--bad)";
+      } else if (btData.window_return > 0) {
+        backtestStatus.style.color = "var(--good)";
+      }
+      if (btData.ok) {
+        backtestImage.src = `/outputs/${btData.image}?t=${Date.now()}`;
+        backtestImage.style.display = "block";
+      }
     });
-  } finally {
-    runButton.disabled = false;
-  }
+  });
 });
 
 document.getElementById("drawChart").addEventListener("click", async () => {
-  const drawButton = document.getElementById("drawChart");
   const symbol = document.getElementById("symbol").value.trim();
   const status = document.getElementById("chartStatus");
   const img = document.getElementById("chartImage");
@@ -1188,28 +1128,22 @@ document.getElementById("drawChart").addEventListener("click", async () => {
     status.textContent = "請先輸入股票代號。";
     return;
   }
-  if (drawButton.disabled) return;
-  drawButton.disabled = true;
   status.textContent = "產生圖表中；第一次需補捉較多資料，請耐心等候...";
   img.style.display = "none";
-  try {
-    const res = await fetch("/api/visualize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol,
-        start_date: document.getElementById("chartStart").value,
-        end_date: document.getElementById("chartEnd").value
-      })
-    });
-    const data = await res.json();
-    status.textContent = data.message || "";
-    if (data.ok) {
-      img.src = `/outputs/${data.image}?t=${Date.now()}`;
-      img.style.display = "block";
-    }
-  } finally {
-    drawButton.disabled = false;
+  const res = await fetch("/api/visualize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      symbol,
+      start_date: document.getElementById("chartStart").value,
+      end_date: document.getElementById("chartEnd").value
+    })
+  });
+  const data = await res.json();
+  status.textContent = data.message || "";
+  if (data.ok) {
+    img.src = `/outputs/${data.image}?t=${Date.now()}`;
+    img.style.display = "block";
   }
 });
 </script>
@@ -1220,7 +1154,6 @@ document.getElementById("drawChart").addEventListener("click", async () => {
 def create_app() -> Flask:
     analyzer = MomentumPRAnalyzer(MomentumConfig())
     app = Flask(__name__)
-    task_lock = threading.Lock()
 
     @app.get("/")
     def index():
@@ -1230,14 +1163,10 @@ def create_app() -> Flask:
     def run_pr():
         payload = request.get_json(silent=True) or {}
         end_date = str(payload.get("end_date", "")).strip()
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。", "rows": []}), 409
         try:
             return jsonify(analyzer.run_market_pr(end_date))
         except Exception as exc:
             return jsonify({"ok": False, "message": f"執行失敗：{exc}", "rows": []}), 500
-        finally:
-            task_lock.release()
 
     @app.post("/api/visualize")
     def visualize():
@@ -1247,14 +1176,10 @@ def create_app() -> Flask:
         end_date = str(payload.get("end_date", "")).strip()
         if not symbol:
             return jsonify({"ok": False, "message": "請輸入股票代號。"}), 400
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。"}), 409
         try:
             return jsonify(analyzer.run_visualization(symbol, start_date, end_date))
         except Exception as exc:
             return jsonify({"ok": False, "message": f"製圖失敗：{exc}"}), 500
-        finally:
-            task_lock.release()
 
     @app.post("/api/backtest-window")
     def backtest_window():
@@ -1265,18 +1190,10 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "message": "缺少股票代號。"}), 400
         if not buy_date:
             return jsonify({"ok": False, "message": "缺少買入日期。"}), 400
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。"}), 409
         try:
-            stop_loss_pct = payload.get("stop_loss_pct")
-            take_profit_pct = payload.get("take_profit_pct")
-            stop_loss_pct = None if stop_loss_pct in (None, "") else float(stop_loss_pct)
-            take_profit_pct = None if take_profit_pct in (None, "") else float(take_profit_pct)
-            return jsonify(analyzer.run_buy_date_window(symbol, buy_date, stop_loss_pct, take_profit_pct))
+            return jsonify(analyzer.run_buy_date_window(symbol, buy_date))
         except Exception as exc:
             return jsonify({"ok": False, "message": f"回測製圖失敗：{exc}"}), 500
-        finally:
-            task_lock.release()
 
     @app.get("/outputs/<path:filename>")
     def outputs(filename):
