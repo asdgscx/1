@@ -1,14 +1,3 @@
-"""
-台股動能 PR 分析工具 (包含 CAN SLIM 7% 絕對停損機制)。
-
-這支程式同時提供兩個功能：
-1. 市場 PR 篩選：讀取指定日期附近的 TWSE 全上市股票清單，抓取股價，
-   計算四個季度區間報酬率，並用 40/20/20/20 權重得到綜合 PR 分數。
-2. 股票代號製圖：輸入股票代號與日期區間，產生個股相對大盤的基期 100 圖，
-   以及 63 日動能 PR 曲線。
-3. 買進視窗回測：模擬買進後的走勢，並執行停利停損策略。
-"""
-
 import io
 import os
 import sqlite3
@@ -24,16 +13,20 @@ os.makedirs(MPL_CONFIG_DIR, exist_ok=True)
 
 import matplotlib
 
-# 🛡️ 強化字體設定：依序尋找 微軟正黑體(Win) -> Arial Unicode MS(Mac) -> 系統預設黑體
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Arial Unicode MS", "sans-serif"]
-matplotlib.rcParams["axes.unicode_minus"] = False  # 避免負號變方塊
+matplotlib.rcParams["axes.unicode_minus"] = False  
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import yfinance as yf
-from flask import Flask, jsonify, request, send_from_directory
+import sys
+import math
+import calendar
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox
 
 HEADERS = {
     "User-Agent": (
@@ -46,7 +39,6 @@ HEADERS = {
 
 @dataclass(frozen=True)
 class MomentumConfig:
-    """集中管理回測、抓資料、PR 計算會用到的可調參數。"""
 
     db_name: str = "taiwan_momentum_pr_backtest.db"
     start_date: str = "2025-01-01"
@@ -59,7 +51,6 @@ class MomentumConfig:
     min_price_coverage_ratio: float = 0.60
     universe_lookback_days: int = 10
     min_pr_universe_count: int = 50
-    # 🛡️ 新增：CAN SLIM 絕對停損比例 (7%)
     stop_loss_pct: float = 0.07 
 
 
@@ -95,6 +86,9 @@ def clean_int(value) -> Optional[int]:
     if number is None:
         return None
     return int(number)
+
+def format_percent(value: float, digits: int = 2) -> str:
+    return f"{float(value):.{digits}f}".rstrip("0").rstrip(".")
 
 def to_twse_date(date_str: str) -> str:
     return date_str.replace("-", "")
@@ -678,9 +672,7 @@ class MomentumPRAnalyzer:
         return {"ok": True, "message": f"已產生 {ticker} 動能視覺化圖。", "image": os.path.basename(output_path)}
 
     def run_buy_date_window(self, code_or_ticker: str, buy_date: str, stop_loss_pct: Optional[float] = None, take_profit_pct: Optional[float] = None) -> dict:
-        """
-        🔥 升級版買入視窗回測：加入 CAN SLIM 絕對停損機制
-        """
+ 
         buy_date = parse_date_or_default(buy_date, self.config.end_date)
         buy_dt = pd.to_datetime(buy_date)
         start_date = (buy_dt - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
@@ -717,7 +709,7 @@ class MomentumPRAnalyzer:
         price_df["close"] = pd.to_numeric(price_df["close"], errors="coerce")
         price_df["open"] = pd.to_numeric(price_df["open"], errors="coerce")
         price_df["high"] = pd.to_numeric(price_df["high"], errors="coerce")
-        price_df["low"] = pd.to_numeric(price_df["low"], errors="coerce") # 載入盤中最低價
+        price_df["low"] = pd.to_numeric(price_df["low"], errors="coerce") 
         price_df = price_df.dropna(subset=["date", "close"]).sort_values("date")
         price_df["buy_line_price"] = price_df["open"].fillna(price_df["close"])
 
@@ -725,13 +717,12 @@ class MomentumPRAnalyzer:
         if buy_rows.empty:
             return {"ok": False, "message": f"{ticker} 在 {buy_date} 之後沒有可買入交易日。"}
 
-        # 1. 確立買進成本與停損價位
         buy_row = buy_rows.iloc[0]
         buy_price = buy_row["open"] if pd.notna(buy_row["open"]) else buy_row["close"]
         stop_price = buy_price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
         take_profit_price = buy_price * (1 + take_profit_pct) if take_profit_pct is not None else None
 
-        # 2. 模擬持有期間 (從買入後的下一天開始檢查停損/停利)
+
         post_buy_df = price_df[price_df["date"] > buy_row["date"]]
         
         stopped_out = False
@@ -740,7 +731,7 @@ class MomentumPRAnalyzer:
         exit_date = price_df.iloc[-1]["date"]
         exit_price = price_df.iloc[-1]["close"]
 
-        # 每天用高低價檢查是否觸發停損或停利；同日都碰到時採保守假設，先視為停損。
+
         for _, daily_row in post_buy_df.iterrows():
             current_low = daily_row["low"] if pd.notna(daily_row["low"]) else daily_row["close"]
             current_high = daily_row["high"] if pd.notna(daily_row["high"]) else daily_row["close"]
@@ -762,7 +753,7 @@ class MomentumPRAnalyzer:
         window_return = (exit_price / buy_price) - 1 if buy_price else 0.0
         display_name = f"{code} {name}"
 
-        # 製圖準備：只使用實際交易日，避免補週末/休市日造成線圖看起來每天跳空。
+
         plot_df = price_df[["date", "open", "high", "low", "close", "buy_line_price"]].copy()
         plot_df = plot_df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
         plot_df["x"] = range(len(plot_df))
@@ -776,11 +767,11 @@ class MomentumPRAnalyzer:
         ax.axvline(buy_x, color="#dc2626", linestyle="--", linewidth=1.4, label="買進日")
         ax.scatter([buy_x], [buy_price], color="#dc2626", s=55, zorder=4)
         
-        # 🛡️ 畫上停損/停利線與出場點位
+      
         if stop_price is not None:
-            ax.hlines(y=stop_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#f59e0b", linestyle=":", linewidth=2, label=f"停損線 (-{stop_loss_pct*100:.1f}%)")
+            ax.hlines(y=stop_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#f59e0b", linestyle=":", linewidth=2, label=f"停損線 (-{format_percent(stop_loss_pct * 100, 1)}%)")
         if take_profit_price is not None:
-            ax.hlines(y=take_profit_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#16a34a", linestyle=":", linewidth=2, label=f"停利線 (+{take_profit_pct*100:.1f}%)")
+            ax.hlines(y=take_profit_price, xmin=buy_x, xmax=plot_df["x"].max(), color="#16a34a", linestyle=":", linewidth=2, label=f"停利線 (+{format_percent(take_profit_pct * 100, 1)}%)")
         if stopped_out or took_profit:
             marker_color = "#000000" if stopped_out else "#16a34a"
             marker_label = "觸發停損出場" if stopped_out else "觸發停利出場"
@@ -822,468 +813,434 @@ class MomentumPRAnalyzer:
             "exit_reason": exit_reason,
         }
 
-APP_HTML = """
-<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>台股動能 PR 分析</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f8fb;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #6b7280;
-      --line: #d8dee8;
-      --brand: #2563eb;
-      --good: #16a34a;
-      --bad: #dc2626;
-      --warn: #f59e0b;
-    }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    main {
-      max-width: 1180px;
-      margin: 0 auto;
-      padding: 28px;
-    }
-    h1 {
-      margin: 0 0 18px;
-      font-size: 28px;
-      letter-spacing: 0;
-    }
-    .tabs {
-      display: flex;
-      gap: 8px;
-      border-bottom: 1px solid var(--line);
-      margin-bottom: 18px;
-    }
-    .tab {
-      border: 0;
-      background: transparent;
-      padding: 12px 16px;
-      font-size: 15px;
-      cursor: pointer;
-      border-bottom: 3px solid transparent;
-      color: var(--muted);
-    }
-    .tab.active {
-      color: var(--brand);
-      border-bottom-color: var(--brand);
-      font-weight: 700;
-    }
-    section {
-      display: none;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 20px;
-    }
-    section.active { display: block; }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 16px;
-    }
-    button.primary {
-      border: 0;
-      background: var(--brand);
-      color: white;
-      border-radius: 6px;
-      padding: 10px 14px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    input {
-      width: min(280px, 100%);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px 12px;
-      font-size: 15px;
-    }
-    input[type="date"] {
-      width: 170px;
-    }
-    input[type="number"] {
-      width: 96px;
-    }
-    label {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    button.small {
-      border: 1px solid var(--line);
-      background: #ffffff;
-      color: var(--brand);
-      border-radius: 6px;
-      padding: 6px 10px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .status {
-      color: var(--text);
-      min-height: 24px;
-      margin: 8px 0 14px;
-      white-space: pre-wrap;
-      font-weight: bold;
-    }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-    .metric {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 12px;
-      background: #fbfdff;
-    }
-    .metric strong {
-      display: block;
-      font-size: 22px;
-      margin-top: 4px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 9px 8px;
-      text-align: right;
-      white-space: nowrap;
-    }
-    th:nth-child(2), th:nth-child(3), th:nth-child(4),
-    td:nth-child(2), td:nth-child(3), td:nth-child(4) {
-      text-align: left;
-    }
-    .table-wrap {
-      overflow: auto;
-      max-height: 560px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-    }
-    .links {
-      display: flex;
-      gap: 12px;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
-    }
-    a {
-      color: var(--brand);
-      font-weight: 600;
-      text-decoration: none;
-    }
-    .chart {
-      width: 100%;
-      max-width: 1080px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      display: none;
-      margin-top: 14px;
-    }
-  </style>
-</head>
-<body>
-<main>
-  <h1>台股動能 PR 分析</h1>
-  <div class="tabs">
-    <button class="tab active" data-tab="market">市場 PR 篩選</button>
-    <button class="tab" data-tab="chart">股票代號製圖</button>
-  </div>
 
-  <section id="market" class="active">
-    <div class="toolbar">
-      <label>查詢日期 <input type="date" id="prDate"></label>
-      <label>停損% <input type="number" id="stopLossPct" min="0" step="0.5" value="7"></label>
-      <label>停利% <input type="number" id="takeProfitPct" min="0" step="0.5" value="20"></label>
-      <button class="primary" id="runPr">執行市場 PR 篩選</button>
-    </div>
-    <div class="status" id="marketStatus" style="color: var(--muted); font-weight: normal;">讀取全上市清單與股價快取，查詢日最早為三年前。</div>
-    <div class="summary">
-      <div class="metric">可計算股票數<strong id="totalCount">-</strong></div>
-      <div class="metric">PR &gt; 80 強勢股<strong id="strongCount">-</strong></div>
-    </div>
-    <div class="links" id="csvLinks"></div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Rank</th><th>名稱</th><th>代號</th><th>綜合分數</th>
-            <th>Q1報酬</th><th>Q2報酬</th><th>Q3報酬</th><th>Q4報酬</th><th>回測</th>
-          </tr>
-        </thead>
-        <tbody id="resultRows"></tbody>
-      </table>
-    </div>
-    <div class="status" id="backtestStatus"></div>
-    <img id="backtestImage" class="chart" alt="buy date backtest chart">
-  </section>
 
-  <section id="chart">
-    <div class="toolbar">
-      <input id="symbol" placeholder="輸入股票代號，例如 2330">
-      <label>開始 <input type="date" id="chartStart"></label>
-      <label>結束 <input type="date" id="chartEnd"></label>
-      <button class="primary" id="drawChart">產生圖表</button>
-    </div>
-    <div class="status" id="chartStatus" style="color: var(--muted); font-weight: normal;">會產生與加權指數的基期 100 對比圖，以及 63 日動能 PR 曲線。</div>
-    <img id="chartImage" class="chart" alt="momentum chart">
-  </section>
-</main>
+def open_file(path: str):
+    if not path:
+        messagebox.showwarning("提醒", "目前沒有可開啟的檔案。")
+        return
+    path = script_path(path)
+    if not os.path.exists(path):
+        messagebox.showerror("錯誤", f"找不到檔案：\n{path}")
+        return
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as exc:
+        messagebox.showerror("錯誤", f"無法開啟檔案：\n{path}\n\n{exc}")
 
-<script>
-const tabs = document.querySelectorAll(".tab");
-tabs.forEach(tab => {
-  tab.addEventListener("click", () => {
-    tabs.forEach(t => t.classList.remove("active"));
-    document.querySelectorAll("section").forEach(s => s.classList.remove("active"));
-    tab.classList.add("active");
-    document.getElementById(tab.dataset.tab).classList.add("active");
-  });
-});
 
-function pct(v) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return "";
-  return (Number(v) * 100).toFixed(2) + "%";
-}
+def parse_optional_float(text: str) -> Optional[float]:
+    text = str(text or "").strip()
+    if text == "":
+        return None
+    return float(text)
 
-function isoDate(d) {
-  return d.toISOString().slice(0, 10);
-}
 
-function addYears(d, years) {
-  const next = new Date(d);
-  next.setFullYear(next.getFullYear() + years);
-  return next;
-}
+def format_return(value) -> str:
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return ""
 
-function addMonths(d, months) {
-  const next = new Date(d);
-  next.setMonth(next.getMonth() + months);
-  return next;
-}
 
-const today = new Date();
-const prDate = document.getElementById("prDate");
-const chartStart = document.getElementById("chartStart");
-const chartEnd = document.getElementById("chartEnd");
-prDate.min = isoDate(addYears(today, -3));
-prDate.max = isoDate(today);
-prDate.value = prDate.max;
-chartEnd.max = isoDate(today);
-chartEnd.value = isoDate(today);
-chartStart.max = chartEnd.value;
-chartStart.value = isoDate(addMonths(today, -16));
+class DateSelector(ttk.Frame):
 
-chartEnd.addEventListener("change", () => {
-  chartStart.max = chartEnd.value;
-});
+    def __init__(self, master, default_date: str, min_year: int, max_year: int):
+        super().__init__(master)
+        default = pd.to_datetime(default_date, errors="coerce")
+        if pd.isna(default):
+            default = pd.Timestamp.today().normalize()
 
-document.getElementById("runPr").addEventListener("click", async () => {
-  const runButton = document.getElementById("runPr");
-  const status = document.getElementById("marketStatus");
-  const selectedDate = document.getElementById("prDate").value;
-  if (runButton.disabled) return;
-  runButton.disabled = true;
-  status.textContent = "執行中，第一次需捕捉較多資料，請耐心等候...";
-  try {
-    const res = await fetch("/api/run-pr", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ end_date: selectedDate })
-    });
-    const data = await res.json();
-    status.textContent = data.message || "";
-    document.getElementById("totalCount").textContent = data.total_count ?? "-";
-    document.getElementById("strongCount").textContent = data.strong_count ?? "-";
+        min_year = min(int(min_year), int(default.year))
+        max_year = max(int(max_year), int(default.year))
 
-    const links = document.getElementById("csvLinks");
-    links.innerHTML = data.ok ? `
-      <a href="/outputs/${data.score_csv}" target="_blank">全部 PR 報表</a>
-      <a href="/outputs/${data.strong_csv}" target="_blank">PR80 強勢股</a>
-    ` : "";
+        self.year_var = tk.StringVar(value=f"{int(default.year):04d}")
+        self.month_var = tk.StringVar(value=f"{int(default.month):02d}")
+        self.day_var = tk.StringVar(value=f"{int(default.day):02d}")
 
-    const body = document.getElementById("resultRows");
-    body.innerHTML = "";
-    (data.rows || []).forEach(row => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${row.rank}</td>
-        <td>${row.name || ""}</td>
-        <td>${row.ticker || ""}</td>
-        <td>${Number(row.weighted_pr_score).toFixed(2)}</td>
-        <td>${pct(row.q1_return_recent)}</td>
-        <td>${pct(row.q2_return)}</td>
-        <td>${pct(row.q3_return)}</td>
-        <td>${pct(row.q4_return_oldest)}</td>
-        <td><button class="small backtest" data-ticker="${row.ticker || ""}">模擬回測</button></td>
-      `;
-      body.appendChild(tr);
-    });
+        years = [str(y) for y in range(min_year, max_year + 1)]
+        months = [f"{m:02d}" for m in range(1, 13)]
 
-    document.querySelectorAll(".backtest").forEach(button => {
-      button.addEventListener("click", async () => {
-        const ticker = button.dataset.ticker;
-        const backtestStatus = document.getElementById("backtestStatus");
-        const backtestImage = document.getElementById("backtestImage");
-        if (button.disabled) return;
-        button.disabled = true;
-        backtestStatus.textContent = `${ticker} 執行停損回測運算中...`;
-        backtestStatus.style.color = "var(--text)";
-        backtestImage.style.display = "none";
-        try {
-          const btRes = await fetch("/api/backtest-window", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              symbol: ticker,
-              buy_date: document.getElementById("prDate").value,
-              stop_loss_pct: document.getElementById("stopLossPct").value,
-              take_profit_pct: document.getElementById("takeProfitPct").value
-            })
-          });
-          const btData = await btRes.json();
-          backtestStatus.textContent = btData.message || "";
-          if (btData.stopped_out) {
-            backtestStatus.style.color = "var(--bad)";
-          } else if (btData.took_profit) {
-            backtestStatus.style.color = "var(--good)";
-          } else if (btData.window_return > 0) {
-            backtestStatus.style.color = "var(--good)";
-          }
-          if (btData.ok) {
-            backtestImage.src = `/outputs/${btData.image}?t=${Date.now()}`;
-            backtestImage.style.display = "block";
-          }
-        } finally {
-          button.disabled = false;
+        self.year_box = ttk.Combobox(self, textvariable=self.year_var, values=years, width=6, state="readonly")
+        self.month_box = ttk.Combobox(self, textvariable=self.month_var, values=months, width=4, state="readonly")
+        self.day_box = ttk.Combobox(self, textvariable=self.day_var, width=4, state="readonly")
+
+        self.year_box.grid(row=0, column=0, padx=(0, 3))
+        ttk.Label(self, text="年").grid(row=0, column=1, padx=(0, 5))
+        self.month_box.grid(row=0, column=2, padx=(0, 3))
+        ttk.Label(self, text="月").grid(row=0, column=3, padx=(0, 5))
+        self.day_box.grid(row=0, column=4, padx=(0, 3))
+        ttk.Label(self, text="日").grid(row=0, column=5)
+
+        self.year_box.bind("<<ComboboxSelected>>", self.update_days)
+        self.month_box.bind("<<ComboboxSelected>>", self.update_days)
+        self.update_days()
+
+    def update_days(self, event=None):
+        try:
+            year = int(self.year_var.get())
+            month = int(self.month_var.get())
+        except ValueError:
+            return
+        max_day = calendar.monthrange(year, month)[1]
+        days = [f"{d:02d}" for d in range(1, max_day + 1)]
+        self.day_box.configure(values=days)
+        try:
+            current_day = int(self.day_var.get())
+        except ValueError:
+            current_day = 1
+        if current_day > max_day:
+            self.day_var.set(f"{max_day:02d}")
+        elif f"{current_day:02d}" not in days:
+            self.day_var.set("01")
+
+    def get(self) -> str:
+        year = self.year_var.get().strip()
+        month = self.month_var.get().strip()
+        day = self.day_var.get().strip()
+        if not year or not month or not day:
+            raise ValueError("日期不可空白。")
+        date_text = f"{year}-{month}-{day}"
+        parsed = pd.to_datetime(date_text, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError("日期格式錯誤。")
+        return parsed.strftime("%Y-%m-%d")
+
+
+class MomentumTkApp:
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("台股動能 PR 分析系統")
+        self.root.geometry("1180x760")
+        self.root.minsize(980, 660)
+
+        self.analyzer = MomentumPRAnalyzer(MomentumConfig())
+        self.is_running = False
+        self.last_score_csv: Optional[str] = None
+        self.last_strong_csv: Optional[str] = None
+        self.last_chart_image: Optional[str] = None
+        self.last_market_backtest_image: Optional[str] = None
+
+        self.build_ui()
+
+    def build_ui(self):
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(self.root)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+        self.market_tab = ttk.Frame(notebook)
+        self.chart_tab = ttk.Frame(notebook)
+
+        notebook.add(self.market_tab, text="市場 PR 篩選")
+        notebook.add(self.chart_tab, text="個股製圖")
+
+        self.root.title("台股動能 PR 分析系統")
+
+        self.build_market_tab()
+        self.build_chart_tab()
+
+    def build_market_tab(self):
+        self.market_tab.columnconfigure(0, weight=1)
+        self.market_tab.rowconfigure(2, weight=1)
+        self.market_tab.rowconfigure(4, weight=1)
+
+        form = ttk.LabelFrame(self.market_tab, text="市場 PR 篩選設定")
+        form.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        for i in range(9):
+            form.columnconfigure(i, weight=0)
+        form.columnconfigure(8, weight=1)
+
+        config = self.analyzer.config
+        today = pd.Timestamp.today().normalize()
+        min_market_year = int((today - pd.DateOffset(years=3)).year)
+        max_market_year = int(today.year)
+
+        ttk.Label(form, text="查詢日期").grid(row=0, column=0, padx=6, pady=8, sticky="w")
+        self.pr_date_selector = DateSelector(form, config.end_date, min_market_year, max_market_year)
+        self.pr_date_selector.grid(row=0, column=1, padx=6, pady=8, sticky="w")
+
+        ttk.Label(form, text="停損% ").grid(row=0, column=2, padx=6, pady=8, sticky="w")
+        self.market_stop_loss_var = tk.StringVar(value=format_percent(config.stop_loss_pct * 100))
+        ttk.Entry(form, textvariable=self.market_stop_loss_var, width=8).grid(row=0, column=3, padx=6, pady=8)
+
+        ttk.Label(form, text="停利% ").grid(row=0, column=4, padx=6, pady=8, sticky="w")
+        self.market_take_profit_var = tk.StringVar(value="20")
+        ttk.Entry(form, textvariable=self.market_take_profit_var, width=8).grid(row=0, column=5, padx=6, pady=8)
+
+        ttk.Button(form, text="執行市場 PR 篩選", command=self.run_market_pr).grid(row=0, column=6, padx=8, pady=8)
+        ttk.Button(form, text="開啟全部 PR CSV", command=lambda: open_file(self.last_score_csv or "")).grid(row=0, column=7, padx=6, pady=8)
+        ttk.Button(form, text="開啟 PR80 CSV", command=lambda: open_file(self.last_strong_csv or "")).grid(row=0, column=8, padx=6, pady=8, sticky="w")
+
+        self.market_status_var = tk.StringVar(value="請選擇查詢日期後執行。第一次可能需要抓取較多資料，請耐心等候。")
+        ttk.Label(self.market_tab, textvariable=self.market_status_var, foreground="#555555").grid(row=1, column=0, sticky="ew", padx=8)
+
+        table_frame = ttk.Frame(self.market_tab)
+        table_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        columns = ("rank", "code", "name", "score", "q1", "q2", "q3", "q4")
+        self.market_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        headings = {
+            "rank": "Rank",
+            "code": "代號",
+            "name": "名稱",
+            "score": "綜合 PR",
+            "q1": "Q1 報酬",
+            "q2": "Q2 報酬",
+            "q3": "Q3 報酬",
+            "q4": "Q4 報酬",
         }
-      });
-    });
-  } finally {
-    runButton.disabled = false;
-  }
-});
+        widths = {"rank": 70, "code": 90, "name": 130, "score": 90, "q1": 90, "q2": 90, "q3": 90, "q4": 90}
+        for col in columns:
+            self.market_tree.heading(col, text=headings[col])
+            self.market_tree.column(col, width=widths[col], anchor="center")
+        self.market_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.market_tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.market_tree.configure(yscrollcommand=tree_scroll.set)
 
-document.getElementById("drawChart").addEventListener("click", async () => {
-  const drawButton = document.getElementById("drawChart");
-  const symbol = document.getElementById("symbol").value.trim();
-  const status = document.getElementById("chartStatus");
-  const img = document.getElementById("chartImage");
-  if (!symbol) {
-    status.textContent = "請先輸入股票代號。";
-    return;
-  }
-  if (drawButton.disabled) return;
-  drawButton.disabled = true;
-  status.textContent = "產生圖表中；第一次需補捉較多資料，請耐心等候...";
-  img.style.display = "none";
-  try {
-    const res = await fetch("/api/visualize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol,
-        start_date: document.getElementById("chartStart").value,
-        end_date: document.getElementById("chartEnd").value
-      })
-    });
-    const data = await res.json();
-    status.textContent = data.message || "";
-    if (data.ok) {
-      img.src = `/outputs/${data.image}?t=${Date.now()}`;
-      img.style.display = "block";
-    }
-  } finally {
-    drawButton.disabled = false;
-  }
-});
-</script>
-</body>
-</html>
-"""
+        action_frame = ttk.Frame(self.market_tab)
+        action_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Button(action_frame, text="用選取股票執行回測", command=self.run_selected_market_backtest).pack(side="left", padx=4)
+        ttk.Button(action_frame, text="開啟回測圖", command=lambda: open_file(self.last_market_backtest_image or "")).pack(side="left", padx=4)
 
-def create_app() -> Flask:
-    analyzer = MomentumPRAnalyzer(MomentumConfig())
-    app = Flask(__name__)
-    task_lock = threading.Lock()
+        result_frame = ttk.LabelFrame(self.market_tab, text="市場頁回測結果")
+        result_frame.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.columnconfigure(1, weight=1)
+        result_frame.rowconfigure(0, weight=1)
 
-    @app.get("/")
-    def index():
-        return APP_HTML
+        self.market_backtest_text = tk.Text(result_frame, height=8, wrap="word")
+        self.market_backtest_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.market_backtest_image_label = ttk.Label(result_frame, text="回測圖會顯示在這裡", anchor="center")
+        self.market_backtest_image_label.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
 
-    @app.post("/api/run-pr")
-    def run_pr():
-        payload = request.get_json(silent=True) or {}
-        end_date = str(payload.get("end_date", "")).strip()
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。", "rows": []}), 409
+    def build_chart_tab(self):
+        self.chart_tab.columnconfigure(0, weight=1)
+        self.chart_tab.rowconfigure(2, weight=1)
+
+        form = ttk.LabelFrame(self.chart_tab, text="個股製圖設定")
+        form.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+
+        config = self.analyzer.config
+        today = pd.Timestamp.today().normalize()
+        default_start = pd.to_datetime(config.start_date, errors="coerce")
+        default_end = pd.to_datetime(config.end_date, errors="coerce")
+        min_chart_year = int(min(
+            today.year - 5,
+            default_start.year if not pd.isna(default_start) else today.year - 5,
+            default_end.year if not pd.isna(default_end) else today.year,
+        ))
+        max_chart_year = int(max(
+            today.year,
+            default_start.year if not pd.isna(default_start) else today.year,
+            default_end.year if not pd.isna(default_end) else today.year,
+        ))
+
+        self.symbol_var = tk.StringVar(value="2330")
+
+        ttk.Label(form, text="股票代號").grid(row=0, column=0, padx=6, pady=8, sticky="w")
+        ttk.Entry(form, textvariable=self.symbol_var, width=12).grid(row=0, column=1, padx=6, pady=8)
+        ttk.Label(form, text="開始日期").grid(row=0, column=2, padx=6, pady=8, sticky="w")
+        self.chart_start_selector = DateSelector(form, config.start_date, min_chart_year, max_chart_year)
+        self.chart_start_selector.grid(row=0, column=3, padx=6, pady=8, sticky="w")
+        ttk.Label(form, text="結束日期").grid(row=0, column=4, padx=6, pady=8, sticky="w")
+        self.chart_end_selector = DateSelector(form, config.end_date, min_chart_year, max_chart_year)
+        self.chart_end_selector.grid(row=0, column=5, padx=6, pady=8, sticky="w")
+        ttk.Button(form, text="產生圖表", command=self.run_chart).grid(row=0, column=6, padx=8, pady=8)
+        ttk.Button(form, text="開啟圖檔", command=lambda: open_file(self.last_chart_image or "")).grid(row=0, column=7, padx=6, pady=8)
+
+        self.chart_status_var = tk.StringVar(value="輸入股票代號並選擇日期區間後，會產生個股 vs 大盤以及 63 日動能 PR 曲線。")
+        ttk.Label(self.chart_tab, textvariable=self.chart_status_var, foreground="#555555").grid(row=1, column=0, sticky="ew", padx=8)
+
+        self.chart_image_label = ttk.Label(self.chart_tab, text="圖表會顯示在這裡", anchor="center")
+        self.chart_image_label.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+
+    def set_busy(self, busy: bool):
+        self.is_running = busy
+        cursor = "watch" if busy else ""
+        self.root.configure(cursor=cursor)
+
+    def run_background(self, job, done, status_var: tk.StringVar, running_text: str):
+        if self.is_running:
+            messagebox.showwarning("提醒", "已有任務執行中，請等目前任務完成。")
+            return
+        self.set_busy(True)
+        status_var.set(running_text)
+
+        def worker():
+            try:
+                result = job()
+                self.root.after(0, lambda: finish(result, None))
+            except Exception as exc:
+                self.root.after(0, lambda: finish(None, exc))
+
+        def finish(result, exc):
+            self.set_busy(False)
+            if exc is not None:
+                status_var.set(f"執行失敗：{exc}")
+                messagebox.showerror("錯誤", f"執行失敗：\n{exc}")
+                return
+            done(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_market_pr(self):
         try:
-            return jsonify(analyzer.run_market_pr(end_date))
-        except Exception as exc:
-            return jsonify({"ok": False, "message": f"執行失敗：{exc}", "rows": []}), 500
-        finally:
-            task_lock.release()
+            end_date = self.pr_date_selector.get()
+        except ValueError as exc:
+            messagebox.showwarning("提醒", str(exc))
+            return
 
-    @app.post("/api/visualize")
-    def visualize():
-        payload = request.get_json(silent=True) or {}
-        symbol = str(payload.get("symbol", "")).strip()
-        start_date = str(payload.get("start_date", "")).strip()
-        end_date = str(payload.get("end_date", "")).strip()
+        error = validate_market_pr_end_date(end_date)
+        if error:
+            messagebox.showwarning("提醒", error)
+            return
+
+        def job():
+            return self.analyzer.run_market_pr(end_date)
+
+        def done(result: dict):
+            self.market_status_var.set(result.get("message", ""))
+            for item in self.market_tree.get_children():
+                self.market_tree.delete(item)
+
+            self.last_score_csv = None
+            self.last_strong_csv = None
+
+            if not result.get("ok"):
+                return
+
+            self.last_score_csv = script_path(result.get("score_csv", ""))
+            self.last_strong_csv = script_path(result.get("strong_csv", ""))
+            summary = f"完成：可計算股票數 {result.get('total_count')}，PR > 80 強勢股 {result.get('strong_count')} 檔。"
+            self.market_status_var.set(summary)
+
+            for row in result.get("rows", []):
+                self.market_tree.insert("", "end", values=(
+                    row.get("rank", ""),
+                    row.get("code", ""),
+                    row.get("name", ""),
+                    f"{float(row.get('weighted_pr_score', 0)):.2f}",
+                    format_return(row.get("q1_return_recent")),
+                    format_return(row.get("q2_return")),
+                    format_return(row.get("q3_return")),
+                    format_return(row.get("q4_return_oldest")),
+                ))
+
+        self.run_background(job, done, self.market_status_var, "執行中，第一次需抓取較多資料，請耐心等候...")
+
+    def get_selected_market_code(self) -> Optional[str]:
+        selected = self.market_tree.selection()
+        if not selected:
+            return None
+        values = self.market_tree.item(selected[0], "values")
+        if len(values) >= 2:
+            return str(values[1]).strip()
+        return None
+
+    def run_selected_market_backtest(self):
+        code = self.get_selected_market_code()
+        if not code:
+            messagebox.showwarning("提醒", "請先在市場 PR 表格中選取一檔股票。")
+            return
+
+        try:
+            buy_date = self.pr_date_selector.get()
+        except ValueError as exc:
+            messagebox.showwarning("提醒", str(exc))
+            return
+
+        try:
+            stop_loss = parse_optional_float(self.market_stop_loss_var.get())
+            take_profit = parse_optional_float(self.market_take_profit_var.get())
+        except ValueError:
+            messagebox.showerror("錯誤", "停損或停利百分比格式錯誤。")
+            return
+
+        self.market_backtest_text.delete("1.0", tk.END)
+        self.market_backtest_text.insert(tk.END, f"{code} 回測中，請稍候...\n")
+
+        def job():
+            return self.analyzer.run_buy_date_window(code, buy_date, stop_loss, take_profit)
+
+        def done(result: dict):
+            self.market_backtest_text.delete("1.0", tk.END)
+            self.market_backtest_text.insert(tk.END, result.get("message", ""))
+            if result.get("ok"):
+                image_path = script_path(result.get("image", ""))
+                self.last_market_backtest_image = image_path
+                self.set_image_preview(self.market_backtest_image_label, image_path, max_width=520, max_height=210)
+            else:
+                self.last_market_backtest_image = None
+                self.market_backtest_image_label.configure(image="", text="回測未產生圖表")
+                self.market_backtest_image_label.image = None
+
+        self.run_background(job, done, self.market_status_var, f"{code} 執行停損停利回測中...")
+
+    def run_chart(self):
+        symbol = self.symbol_var.get().strip()
+        try:
+            start_date = self.chart_start_selector.get()
+            end_date = self.chart_end_selector.get()
+        except ValueError as exc:
+            messagebox.showwarning("提醒", str(exc))
+            return
+
         if not symbol:
-            return jsonify({"ok": False, "message": "請輸入股票代號。"}), 400
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。"}), 409
+            messagebox.showwarning("提醒", "請輸入股票代號。")
+            return
+        if pd.to_datetime(start_date) >= pd.to_datetime(end_date):
+            messagebox.showwarning("提醒", "開始日期必須早於結束日期。")
+            return
+        if pd.to_datetime(end_date).normalize() > pd.Timestamp.today().normalize():
+            messagebox.showwarning("提醒", "結束日期不能晚於今天。")
+            return
+
+        def job():
+            return self.analyzer.run_visualization(symbol, start_date, end_date)
+
+        def done(result: dict):
+            self.chart_status_var.set(result.get("message", ""))
+            if result.get("ok"):
+                image_path = script_path(result.get("image", ""))
+                self.last_chart_image = image_path
+                self.set_image_preview(self.chart_image_label, image_path, max_width=1060, max_height=570)
+            else:
+                self.last_chart_image = None
+                self.chart_image_label.configure(image="", text="圖表未產生")
+                self.chart_image_label.image = None
+
+        self.run_background(job, done, self.chart_status_var, "產生圖表中，第一次需補抓資料，請耐心等候...")
+
+    def set_image_preview(self, label: ttk.Label, image_path: str, max_width: int, max_height: int):
+        """在 tkinter 中預覽 PNG。若圖片太大，用整數比例縮小。"""
+        if not image_path or not os.path.exists(image_path):
+            label.configure(image="", text=f"找不到圖檔：{image_path}")
+            label.image = None
+            return
         try:
-            return jsonify(analyzer.run_visualization(symbol, start_date, end_date))
+            img = tk.PhotoImage(file=image_path)
+            scale = max(1, math.ceil(img.width() / max_width), math.ceil(img.height() / max_height))
+            if scale > 1:
+                img = img.subsample(scale, scale)
+            label.configure(image=img, text="")
+            label.image = img
         except Exception as exc:
-            return jsonify({"ok": False, "message": f"製圖失敗：{exc}"}), 500
-        finally:
-            task_lock.release()
-
-    @app.post("/api/backtest-window")
-    def backtest_window():
-        payload = request.get_json(silent=True) or {}
-        symbol = str(payload.get("symbol", "")).strip()
-        buy_date = str(payload.get("buy_date", "")).strip()
-        if not symbol:
-            return jsonify({"ok": False, "message": "缺少股票代號。"}), 400
-        if not buy_date:
-            return jsonify({"ok": False, "message": "缺少買入日期。"}), 400
-        if not task_lock.acquire(blocking=False):
-            return jsonify({"ok": False, "message": "已有任務執行中，請等目前抓取完成。"}), 409
-        try:
-            stop_loss_pct = payload.get("stop_loss_pct")
-            take_profit_pct = payload.get("take_profit_pct")
-            stop_loss_pct = None if stop_loss_pct in (None, "") else float(stop_loss_pct)
-            take_profit_pct = None if take_profit_pct in (None, "") else float(take_profit_pct)
-            return jsonify(analyzer.run_buy_date_window(symbol, buy_date, stop_loss_pct, take_profit_pct))
-        except Exception as exc:
-            return jsonify({"ok": False, "message": f"回測製圖失敗：{exc}"}), 500
-        finally:
-            task_lock.release()
-
-    @app.get("/outputs/<path:filename>")
-    def outputs(filename):
-        return send_from_directory(os.path.dirname(os.path.abspath(__file__)), filename)
-
-    return app
+            label.configure(image="", text=f"圖檔已產生：\n{image_path}\n\n無法預覽：{exc}")
+            label.image = None
 
 
 if __name__ == "__main__":
-    create_app().run(host="127.0.0.1", port=5009, debug=False)
+    root = tk.Tk()
+    app = MomentumTkApp(root)
+    root.mainloop()
