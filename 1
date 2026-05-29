@@ -436,7 +436,7 @@ class MomentumPRAnalyzer:
                 print(f"[{idx + 1}/{len(listed_df)}] {ticker} 股價已存在 SQL，略過")
                 continue
             if self.db.has_price_fetch_failure(ticker, start_date, end_date):
-                print(f"[{idx + 1}/{len(listed_df)}] {ticker} 先前抓不到這段股價，略過重試")
+                print(f"[{idx + 1}/{len(listed_df)}] {ticker} 先前抓不到或資料不足，略過重試")
                 continue
             print(f"[{idx + 1}/{len(listed_df)}] 抓股價：{code} {name} ({ticker})")
             try:
@@ -450,6 +450,23 @@ class MomentumPRAnalyzer:
                 continue
             saved = self.db.save_price_history(code, name, ticker, hist)
             print(f"  已存入 {saved} 筆")
+
+
+            if not self.db.has_price_range(
+                ticker,
+                start_date,
+                end_date,
+                self.config.max_price_gap_days,
+                self.config.min_price_coverage_ratio,
+            ):
+                self.db.save_price_fetch_failure(
+                    ticker,
+                    start_date,
+                    end_date,
+                    f"incomplete history after fetch; saved_rows={saved}",
+                )
+                print("  資料仍不完整，已記錄為略過重試")
+
             time.sleep(self.config.yfinance_sleep) 
 
     def build_close_pivot(self, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
@@ -792,7 +809,6 @@ class MomentumPRAnalyzer:
         fig.savefig(output_path, dpi=160)
         plt.close(fig)
 
-        # 動態產生回報訊息
         msg = f"{display_name}：買入 {buy_row['date'].strftime('%Y-%m-%d')} ({buy_price:.2f})。"
         if stopped_out:
             msg += f" 於 {exit_date.strftime('%Y-%m-%d')} 觸發停損出場，結算報酬率 {window_return * 100:.2f}%"
@@ -1223,7 +1239,6 @@ class MomentumTkApp:
         self.run_background(job, done, self.chart_status_var, "產生圖表中，第一次需補抓資料，請耐心等候...")
 
     def set_image_preview(self, label: ttk.Label, image_path: str, max_width: int, max_height: int):
-        """在 tkinter 中預覽 PNG。若圖片太大，用整數比例縮小。"""
         if not image_path or not os.path.exists(image_path):
             label.configure(image="", text=f"找不到圖檔：{image_path}")
             label.image = None
